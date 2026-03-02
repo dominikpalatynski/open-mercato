@@ -4,6 +4,7 @@ import * as React from 'react'
 import { Send } from 'lucide-react'
 import { useT } from '@open-mercato/shared/lib/i18n/context'
 import { Button } from '../../primitives/button'
+import { apiCall } from '../utils/apiCall'
 import {
   MessageComposer,
   type MessageComposerContextObject,
@@ -17,10 +18,42 @@ export type SendObjectMessageDialogProps = {
   lockedType?: string | null
   requiredActionConfig?: MessageComposerRequiredActionConfig | null
   disabled?: boolean
-  contextPreview?: React.ReactNode
-  children?: React.ReactNode
+  canCompose?: boolean
+  viewHref?: string | null
   onSuccess?: MessageComposerProps['onSuccess']
-  renderTrigger?: (params: { openComposer: () => void; disabled: boolean }) => React.ReactNode
+}
+
+type FeatureCheckResponse = {
+  granted?: string[]
+}
+
+let composeAccessCache: boolean | null = null
+let composeAccessPromise: Promise<boolean> | null = null
+
+async function readComposeAccess(): Promise<boolean> {
+  if (composeAccessCache !== null) return composeAccessCache
+  if (composeAccessPromise) return composeAccessPromise
+
+  composeAccessPromise = (async () => {
+    try {
+      const call = await apiCall<FeatureCheckResponse>('/api/auth/feature-check', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ features: ['messages.compose'] }),
+      })
+      const granted = Array.isArray(call.result?.granted) ? call.result.granted : []
+      const canCompose = granted.includes('messages.compose')
+      composeAccessCache = canCompose
+      return canCompose
+    } catch {
+      composeAccessCache = false
+      return false
+    } finally {
+      composeAccessPromise = null
+    }
+  })()
+
+  return composeAccessPromise
 }
 
 export function SendObjectMessageDialog({
@@ -29,33 +62,58 @@ export function SendObjectMessageDialog({
   lockedType = 'messages.defaultWithObjects',
   requiredActionConfig = null,
   disabled = false,
-  contextPreview = null,
-  children = null,
+  canCompose,
+  viewHref: _viewHref = null,
   onSuccess,
-  renderTrigger,
 }: SendObjectMessageDialogProps) {
   const t = useT()
   const [open, setOpen] = React.useState(false)
+  const [composeEnabled, setComposeEnabled] = React.useState<boolean>(canCompose ?? false)
+  const [composeAccessResolved, setComposeAccessResolved] = React.useState<boolean>(canCompose !== undefined)
+
+  React.useEffect(() => {
+    if (canCompose !== undefined) {
+      setComposeEnabled(canCompose)
+      setComposeAccessResolved(true)
+      return
+    }
+
+    let mounted = true
+    void (async () => {
+      const allowed = await readComposeAccess()
+      if (!mounted) return
+      setComposeEnabled(allowed)
+      setComposeAccessResolved(true)
+    })()
+
+    return () => {
+      mounted = false
+    }
+  }, [canCompose])
 
   const openComposer = React.useCallback(() => {
-    if (disabled) return
+    if (disabled || !composeEnabled) return
     setOpen(true)
-  }, [disabled])
+  }, [disabled, composeEnabled])
   const contextObject = React.useMemo(() => ({
     entityModule: object.entityModule,
     entityType: object.entityType,
     entityId: object.entityId,
     sourceEntityType: object.sourceEntityType ?? null,
     sourceEntityId: object.sourceEntityId ?? null,
-  }), [object.entityId, object.entityModule, object.entityType, object.sourceEntityId, object.sourceEntityType])
+    previewData: object.previewData ?? null,
+  }), [object.entityId, object.entityModule, object.entityType, object.sourceEntityId, object.sourceEntityType, object.previewData])
 
-  const trigger = renderTrigger
-    ? renderTrigger({ openComposer, disabled })
-    : (
+  if (!composeAccessResolved || !composeEnabled) {
+    return null
+  }
+
+  return (
+    <>
       <Button
         type="button"
         size="icon"
-        variant="outline"
+        variant="ghost"
         disabled={disabled}
         onClick={openComposer}
         aria-label={t('messages.compose', 'Compose message')}
@@ -63,11 +121,6 @@ export function SendObjectMessageDialog({
       >
         <Send className="h-4 w-4" />
       </Button>
-    )
-    
-  return (
-    <>
-      {trigger}
       <MessageComposer
         variant="compose"
         open={open}
@@ -75,7 +128,6 @@ export function SendObjectMessageDialog({
         lockedType={lockedType}
         contextObject={contextObject}
         requiredActionConfig={requiredActionConfig}
-        contextPreview={contextPreview ?? children}
         defaultValues={defaultValues}
         onSuccess={onSuccess}
       />
