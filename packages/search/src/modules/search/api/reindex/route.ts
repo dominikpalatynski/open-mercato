@@ -15,6 +15,7 @@ import {
   clearReindexLock,
   getReindexLockStatus,
 } from '../../lib/reindex-lock'
+import { reindexOpenApi } from '../openapi'
 
 /** Strategy with optional stats support */
 type StrategyWithStats = SearchStrategy & {
@@ -193,7 +194,7 @@ export async function POST(req: Request) {
           organizationId: orgId,
           recreateIndex: true,
           useQueue,
-          onProgress: async (progress) => {
+          onProgress: (progress) => {
             searchDebug('search.reindex', 'Progress', progress)
             // Note: Heartbeat is updated by workers during job processing, not during enqueueing
           },
@@ -249,7 +250,7 @@ export async function POST(req: Request) {
           organizationId: orgId,
           recreateIndex: true,
           useQueue,
-          onProgress: async (progress) => {
+          onProgress: (progress) => {
             searchDebug('search.reindex', 'Progress', progress)
             // Note: Heartbeat is updated by workers during job processing, not during enqueueing
           },
@@ -417,3 +418,5 @@ export async function POST(req: Request) {
     }
   }
 }
+
+export const openApi = reindexOpenApi

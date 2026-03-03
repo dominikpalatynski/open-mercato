@@ -13,6 +13,7 @@ import {
   buildCustomFieldResetMap,
   diffCustomFieldChanges,
 } from '@open-mercato/shared/lib/commands/customFieldSnapshots'
+import { extractUndoPayload } from '@open-mercato/shared/lib/commands/undo'
 import {
   parseWithCustomFields,
   setCustomFieldsIfAny,
@@ -23,6 +24,7 @@ import {
   buildChanges,
 } from '@open-mercato/shared/lib/commands/helpers'
 import { resolveTranslations } from '@open-mercato/shared/lib/i18n/server'
+import { toOptionalString } from '@open-mercato/shared/lib/string/coerce'
 
 export const organizationCrudEvents: CrudEventsConfig = {
   module: 'directory',
@@ -307,7 +309,7 @@ const createOrganizationCommand: CommandHandler<Record<string, unknown>, Organiz
     return organization
   },
   captureAfter: async (_input, result, ctx) => {
-    const em = (ctx.container.resolve('em') as EntityManager)
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     const tenantId = resolveTenantIdFromEntity(result)
     const custom = await loadCustomFieldSnapshot(em, {
       entityId: E.directory.organization,
@@ -320,7 +322,7 @@ const createOrganizationCommand: CommandHandler<Record<string, unknown>, Organiz
   buildLog: async ({ result, ctx }) => {
     const { translate } = await resolveTranslations()
     const meta = getUndoMeta(result)
-    const em = (ctx.container.resolve('em') as EntityManager)
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     const tenantId = resolveTenantIdFromEntity(result)
     const custom = await loadCustomFieldSnapshot(em, {
       entityId: E.directory.organization,
@@ -344,7 +346,7 @@ const createOrganizationCommand: CommandHandler<Record<string, unknown>, Organiz
     }
   },
   undo: async ({ logEntry, ctx }) => {
-    const payload = extractOrganizationUndoPayload(logEntry)
+    const payload = extractUndoPayload<OrganizationUndoPayload>(logEntry)
     const after = payload?.after
     const childrenBefore = payload?.childrenBefore ?? []
     if (!after) return
@@ -487,7 +489,7 @@ const updateOrganizationCommand: CommandHandler<Record<string, unknown>, Organiz
     return organization
   },
   captureAfter: async (_input, result, ctx) => {
-    const em = (ctx.container.resolve('em') as EntityManager)
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     const tenantId = resolveTenantIdFromEntity(result)
     const custom = await loadCustomFieldSnapshot(em, {
       entityId: E.directory.organization,
@@ -502,7 +504,7 @@ const updateOrganizationCommand: CommandHandler<Record<string, unknown>, Organiz
     const meta = getUndoMeta(result)
     const beforeSnapshots = snapshots.before as OrganizationSnapshots | undefined
     const beforeRecord = beforeSnapshots?.view ?? null
-    const em = (ctx.container.resolve('em') as EntityManager)
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     const tenantId = resolveTenantIdFromEntity(result)
     const custom = await loadCustomFieldSnapshot(em, {
       entityId: E.directory.organization,
@@ -531,7 +533,7 @@ const updateOrganizationCommand: CommandHandler<Record<string, unknown>, Organiz
     }
   },
   undo: async ({ logEntry, ctx }) => {
-    const payload = extractOrganizationUndoPayload(logEntry)
+    const payload = extractUndoPayload<OrganizationUndoPayload>(logEntry)
     const before = payload?.before
     const after = payload?.after
     if (!before) return
@@ -675,7 +677,7 @@ const deleteOrganizationCommand: CommandHandler<{ body: any; query: Record<strin
     }
   },
   undo: async ({ logEntry, ctx }) => {
-    const payload = extractOrganizationUndoPayload(logEntry)
+    const payload = extractUndoPayload<OrganizationUndoPayload>(logEntry)
     const before = payload?.before
     if (!before) return
     const tenantId = before.tenantId
@@ -756,28 +758,9 @@ function setUndoMeta(entity: Organization, meta: Partial<OrganizationUndoMeta>) 
   Reflect.set(entity, UNDO_META_KEY, { ...current, ...meta })
 }
 
-function extractOrganizationUndoPayload(logEntry: { commandPayload?: unknown }): OrganizationUndoPayload | null {
-  if (!logEntry || typeof logEntry !== 'object') return null
-  const payload = logEntry.commandPayload as { undo?: OrganizationUndoPayload } | undefined
-  if (!payload || typeof payload !== 'object') return null
-  const undo = payload.undo
-  if (!undo || typeof undo !== 'object') return null
-  return {
-    before: undo.before ?? null,
-    after: undo.after ?? null,
-    childrenBefore: undo.childrenBefore ?? null,
-  }
-}
-
 registerCommand(createOrganizationCommand)
 registerCommand(updateOrganizationCommand)
 registerCommand(deleteOrganizationCommand)
-
-function toOptionalString(value: unknown): string | null {
-  if (typeof value === 'string' && value.trim()) return value
-  if (typeof value === 'number' || typeof value === 'bigint') return String(value)
-  return null
-}
 
 function setInternalTenantId(entity: Organization, tenantId: string) {
   Reflect.set(entity, '__tenantId', tenantId)

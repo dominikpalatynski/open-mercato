@@ -1,4 +1,5 @@
 import { makeCrudRoute } from '@open-mercato/shared/lib/crud/factory'
+import { registerApiInterceptors } from '@open-mercato/shared/lib/crud/interceptor-registry'
 import { z } from 'zod'
 
 // ---- Mocks ----
@@ -8,6 +9,7 @@ type Rec = { id: string; organizationId: string; tenantId: string; title?: strin
 let db: Record<string, Rec>
 let idSeq = 1
 let commandBus: { execute: jest.Mock }
+let crudMutationGuardService: { validateMutation: jest.Mock; afterMutationSuccess: jest.Mock } | null
 
 const em = {
   create: (_cls: any, data: any) => ({ ...data, id: `id-${idSeq++}` }),
@@ -94,6 +96,7 @@ jest.mock('@open-mercato/shared/lib/di/container', () => ({
       dataEngine: mockDataEngine,
       accessLogService,
       commandBus,
+      crudMutationGuardService,
     } as any)[name],
   })
 }))
@@ -124,6 +127,8 @@ describe('CRUD Factory', () => {
     commandBus = {
       execute: jest.fn(async () => ({ result: {}, logEntry: { id: 'log-1' } })),
     }
+    crudMutationGuardService = null
+    registerApiInterceptors([])
   })
 
   const querySchema = z.object({
@@ -303,7 +308,43 @@ describe('CRUD Factory', () => {
     expect(db[created.id].deletedAt).toBeInstanceOf(Date)
   })
 
-  it('DELETE command route uses domain-specific ids from result when emitting events', async () => {
+  it('PUT mutation guard uses route resource identity instead of spoofed lock headers', async () => {
+    crudMutationGuardService = {
+      validateMutation: jest.fn().mockResolvedValue({
+        ok: true,
+        shouldRunAfterSuccess: false,
+      }),
+      afterMutationSuccess: jest.fn().mockResolvedValue(undefined),
+    }
+
+    const created = em.create(Todo, {
+      title: 'X',
+      organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      tenantId: '123e4567-e89b-12d3-a456-426614174000',
+    }) as Rec
+    created.id = '123e4567-e89b-12d3-a456-426614174051'
+    await em.persistAndFlush(created)
+
+    const res = await route.PUT(new Request('http://x/api/example/todos', {
+      method: 'PUT',
+      body: JSON.stringify({ id: created.id, title: 'X2' }),
+      headers: {
+        'content-type': 'application/json',
+        'x-om-spoof-kind': 'spoof.kind',
+        'x-om-spoof-id': 'spoof-id',
+      },
+    }))
+
+    expect(res.status).toBe(200)
+    expect(crudMutationGuardService.validateMutation).toHaveBeenCalledTimes(1)
+    expect(crudMutationGuardService.validateMutation).toHaveBeenCalledWith(expect.objectContaining({
+      resourceKind: 'example.todo',
+      resourceId: created.id,
+      requestHeaders: expect.any(Headers),
+    }))
+  })
+
+  it('DELETE command route delegates event emission to CommandBus (no factory-level emission)', async () => {
     const indexedId = 'line-999'
     commandBus.execute.mockResolvedValue({
       result: { lineId: indexedId, orderId: 'order-1' },
@@ -324,10 +365,73 @@ describe('CRUD Factory', () => {
     const res = await commandRoute.DELETE(new Request('http://x/api/example/todos/command', { method: 'DELETE', body: JSON.stringify({}), headers: { 'content-type': 'application/json' } }))
     expect(res.status).toBe(200)
     expect(commandBus.execute).toHaveBeenCalledWith('example.todo.delete', expect.anything())
-    expect(mockDataEngine.emitOrmEntityEvent).toHaveBeenCalledTimes(1)
-    const [deletedArgs] = mockDataEngine.emitOrmEntityEvent.mock.calls[0]!
-    expect(deletedArgs.action).toBe('deleted')
-    expect(deletedArgs.identifiers.id).toBe(indexedId)
-    expect(deletedArgs.indexer?.entityType).toBe('example.todo')
+    // Command-based paths delegate side effects (events + indexing) entirely to the
+    // CommandBus via flushCrudSideEffects(). The factory itself must NOT emit events
+    // to avoid duplicates (see commit 3f999f35).
+    expect(mockDataEngine.emitOrmEntityEvent).not.toHaveBeenCalled()
+  })
+
+  it('POST is blocked by interceptor before hook', async () => {
+    registerApiInterceptors([
+      {
+        moduleId: 'example',
+        interceptors: [
+          {
+            id: 'example.block-title',
+            targetRoute: 'example/todos',
+            methods: ['POST'],
+            async before(request) {
+              const title = request.body?.title
+              if (typeof title === 'string' && title.includes('BLOCKED')) {
+                return { ok: false, statusCode: 422, message: 'Blocked by interceptor' }
+              }
+              return { ok: true }
+            },
+          },
+        ],
+      },
+    ])
+
+    const res = await route.POST(new Request('http://x/api/example/todos', {
+      method: 'POST',
+      body: JSON.stringify({ title: 'BLOCKED item', is_done: false }),
+      headers: { 'content-type': 'application/json' },
+    }))
+    expect(res.status).toBe(422)
+    const payload = await res.json()
+    expect(payload).toMatchObject({
+      error: 'Blocked by interceptor',
+      interceptorId: 'example.block-title',
+    })
+  })
+
+  it('GET response is augmented by interceptor after hook', async () => {
+    registerApiInterceptors([
+      {
+        moduleId: 'example',
+        interceptors: [
+          {
+            id: 'example.add-response-flag',
+            targetRoute: 'example/todos',
+            methods: ['GET'],
+            async after(_request, response) {
+              return {
+                merge: {
+                  _interceptor: {
+                    ok: true,
+                    count: Array.isArray(response.body.items) ? response.body.items.length : 0,
+                  },
+                },
+              }
+            },
+          },
+        ],
+      },
+    ])
+
+    const res = await route.GET(new Request('http://x/api/example/todos?page=1&pageSize=10&sortField=id&sortDir=asc'))
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body._interceptor).toEqual({ ok: true, count: 1 })
   })
 })

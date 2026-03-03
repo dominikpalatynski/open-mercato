@@ -33,6 +33,7 @@ import {
 import { resolveDictionaryEntryValue } from '../lib/dictionaries'
 import { invalidateCrudCache } from '@open-mercato/shared/lib/crud/cache'
 import { emitCrudSideEffects } from '@open-mercato/shared/lib/commands/helpers'
+import type { CrudEventsConfig } from '@open-mercato/shared/lib/crud/types'
 import type { DataEngine } from '@open-mercato/shared/lib/data/engine'
 import { findOneWithDecryption, findWithDecryption } from '@open-mercato/shared/lib/encryption/find'
 import { resolveNotificationService } from '../../notifications/lib/notificationService'
@@ -85,6 +86,17 @@ const toNumber = (value: unknown): number => {
 
 const normalizeCustomFieldsInput = (input: unknown): Record<string, unknown> =>
   input && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, unknown>) : {}
+
+const paymentCrudEvents: CrudEventsConfig = {
+  module: 'sales',
+  entity: 'payment',
+  persistent: true,
+  buildPayload: (ctx) => ({
+    id: ctx.identifiers.id,
+    organizationId: ctx.identifiers.organizationId,
+    tenantId: ctx.identifiers.tenantId,
+  }),
+}
 
 const ORDER_RESOURCE = 'sales.order'
 
@@ -186,6 +198,7 @@ export async function restorePaymentSnapshot(em: EntityManager, snapshot: Paymen
   entity.customFieldSetId =
     (snapshot as any).customFieldSetId ?? (snapshot as any).custom_field_set_id ?? null
   entity.updatedAt = new Date()
+  await em.flush()
 
   if ((snapshot as any).customFields !== undefined) {
     await setRecordCustomFields(em, {
@@ -426,6 +439,20 @@ const createPaymentCommand: CommandHandler<
     await em.flush()
     await invalidateOrderCache(ctx.container, order, ctx.auth?.tenantId ?? null)
 
+    const dataEngine = ctx.container.resolve('dataEngine') as DataEngine
+    await emitCrudSideEffects({
+      dataEngine,
+      action: 'created',
+      entity: payment,
+      identifiers: {
+        id: payment.id,
+        organizationId: payment.organizationId,
+        tenantId: payment.tenantId,
+      },
+      indexer: { entityType: E.sales.sales_payment },
+      events: paymentCrudEvents,
+    })
+
     // Create notification for payment received
     try {
       const notificationService = resolveNotificationService(ctx.container)
@@ -458,7 +485,7 @@ const createPaymentCommand: CommandHandler<
     return { paymentId: payment.id, orderTotals: totals }
   },
   captureAfter: async (_input, result, ctx) => {
-    const em = ctx.container.resolve('em') as EntityManager
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     return result?.paymentId ? loadPaymentSnapshot(em, result.paymentId) : null
   },
   buildLog: async ({ result, snapshots }) => {
@@ -469,6 +496,8 @@ const createPaymentCommand: CommandHandler<
       actionLabel: translate('sales.audit.payments.create', 'Create payment'),
       resourceKind: 'sales.payment',
       resourceId: result.paymentId,
+      parentResourceKind: 'sales.order',
+      parentResourceId: after.orderId ?? null,
       tenantId: after.tenantId,
       organizationId: after.organizationId,
       snapshotAfter: after,
@@ -535,21 +564,27 @@ const updatePaymentCommand: CommandHandler<
   },
   async execute(rawInput, ctx) {
     const input = paymentUpdateSchema.parse(rawInput ?? {})
-    ensureTenantScope(ctx, input.tenantId)
-    ensureOrganizationScope(ctx, input.organizationId)
     const em = (ctx.container.resolve('em') as EntityManager).fork()
     const { translate } = await resolveTranslations()
+    const scopeSeed = assertFound(
+      await em.findOne(SalesPayment, { id: input.id }),
+      'sales.payments.not_found'
+    )
+    const resolvedTenantId = input.tenantId ?? scopeSeed.tenantId
+    const resolvedOrganizationId = input.organizationId ?? scopeSeed.organizationId
+    ensureTenantScope(ctx, resolvedTenantId)
+    ensureOrganizationScope(ctx, resolvedOrganizationId)
     const payment = assertFound(
       await findOneWithDecryption(
         em,
         SalesPayment,
         { id: input.id },
         { populate: ['order'] },
-        { tenantId: input.tenantId, organizationId: input.organizationId },
+        { tenantId: resolvedTenantId, organizationId: resolvedOrganizationId },
       ),
       'sales.payments.not_found'
     )
-    ensureSameScope(payment, input.organizationId, input.tenantId)
+    ensureSameScope(payment, resolvedOrganizationId, resolvedTenantId)
     const previousOrder = payment.order as SalesOrder | null
     if (input.orderId !== undefined) {
       if (!input.orderId) {
@@ -559,7 +594,7 @@ const updatePaymentCommand: CommandHandler<
           await em.findOne(SalesOrder, { id: input.orderId }),
           'sales.payments.order_not_found'
         )
-        ensureSameScope(order, input.organizationId, input.tenantId)
+        ensureSameScope(order, resolvedOrganizationId, resolvedTenantId)
         if (
           order.currencyCode &&
           input.currencyCode &&
@@ -580,7 +615,7 @@ const updatePaymentCommand: CommandHandler<
           await em.findOne(SalesPaymentMethod, { id: input.paymentMethodId }),
           'sales.payments.method_not_found'
         )
-        ensureSameScope(method, input.organizationId, input.tenantId)
+        ensureSameScope(method, resolvedOrganizationId, resolvedTenantId)
         payment.paymentMethod = method
       }
     }
@@ -695,10 +730,24 @@ const updatePaymentCommand: CommandHandler<
       await invalidateOrderCache(ctx.container, previousOrder, ctx.auth?.tenantId ?? null)
     }
 
+    const dataEngine = ctx.container.resolve('dataEngine') as DataEngine
+    await emitCrudSideEffects({
+      dataEngine,
+      action: 'updated',
+      entity: payment,
+      identifiers: {
+        id: payment.id,
+        organizationId: payment.organizationId,
+        tenantId: payment.tenantId,
+      },
+      indexer: { entityType: E.sales.sales_payment },
+      events: paymentCrudEvents,
+    })
+
     return { paymentId: payment.id, orderTotals: totals }
   },
   captureAfter: async (_input, result, ctx) => {
-    const em = ctx.container.resolve('em') as EntityManager
+    const em = (ctx.container.resolve('em') as EntityManager).fork()
     return result?.paymentId ? loadPaymentSnapshot(em, result.paymentId) : null
   },
   buildLog: async ({ snapshots, result }) => {
@@ -709,6 +758,8 @@ const updatePaymentCommand: CommandHandler<
       actionLabel: translate('sales.audit.payments.update', 'Update payment'),
       resourceKind: 'sales.payment',
       resourceId: result.paymentId,
+      parentResourceKind: 'sales.order',
+      parentResourceId: after?.orderId ?? before?.orderId ?? null,
       tenantId: after?.tenantId ?? before?.tenantId ?? null,
       organizationId: after?.organizationId ?? before?.organizationId ?? null,
       snapshotBefore: before ?? null,
@@ -799,6 +850,18 @@ const deletePaymentCommand: CommandHandler<
       await invalidateOrderCache(ctx.container, target, ctx.auth?.tenantId ?? null)
     }
     const dataEngine = ctx.container.resolve('dataEngine') as DataEngine
+    await emitCrudSideEffects({
+      dataEngine,
+      action: 'deleted',
+      entity: payment,
+      identifiers: {
+        id: payment.id,
+        organizationId: payment.organizationId,
+        tenantId: payment.tenantId,
+      },
+      indexer: { entityType: E.sales.sales_payment },
+      events: paymentCrudEvents,
+    })
     if (allocations.length) {
       await Promise.all(
         allocations.map((allocation) =>
@@ -825,6 +888,8 @@ const deletePaymentCommand: CommandHandler<
       actionLabel: translate('sales.audit.payments.delete', 'Delete payment'),
       resourceKind: 'sales.payment',
       resourceId: result.paymentId,
+      parentResourceKind: 'sales.order',
+      parentResourceId: before?.orderId ?? null,
       tenantId: before?.tenantId ?? null,
       organizationId: before?.organizationId ?? null,
       snapshotBefore: before ?? null,

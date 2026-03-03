@@ -1,8 +1,10 @@
 import path from 'node:path'
 import fs from 'node:fs'
+import { pathToFileURL } from 'node:url'
 import { MikroORM, type Logger } from '@mikro-orm/core'
 import { Migrator } from '@mikro-orm/migrations'
 import { PostgreSqlDriver } from '@mikro-orm/postgresql'
+import { getSslConfig } from '@open-mercato/shared/lib/db/ssl'
 import type { PackageResolver, ModuleEntry } from '../resolver'
 
 const QUIET_MODE = process.env.OM_CLI_QUIET === '1' || process.env.MERCATO_QUIET === '1'
@@ -48,6 +50,21 @@ function sortModules(mods: ModuleEntry[]): ModuleEntry[] {
 }
 
 /**
+ * Custom dynamic import provider for MikroORM that properly handles Windows paths.
+ * MikroORM's built-in handling has a bug where it converts file:// URLs back to
+ * Windows paths when the extension isn't in require.extensions (which is always
+ * true for .ts files in ESM mode).
+ */
+async function dynamicImportProvider(id: string): Promise<any> {
+  // On Windows, convert absolute paths to file:// URLs
+  // Check if it's a Windows absolute path (e.g., C:\... or D:\...)
+  if (process.platform === 'win32' && /^[a-zA-Z]:[\\/]/.test(id)) {
+    id = pathToFileURL(id).href
+  }
+  return import(id)
+}
+
+/**
  * Sanitizes a module ID for use in SQL identifiers (table names).
  * Replaces non-alphanumeric characters with underscores to prevent SQL injection.
  * @public Exported for testing
@@ -87,7 +104,7 @@ async function loadModuleEntities(entry: ModuleEntry, resolver: PackageResolver)
         const fromApp = base.startsWith(roots.appBase)
         // For @app modules, use file:// URL since @/ alias doesn't work in Node.js runtime
         const importPath = (isAppModule && fromApp)
-          ? `file://${p.replace(/\.ts$/, '.js')}`
+          ? pathToFileURL(p.replace(/\.ts$/, '.js')).href
           : `${fromApp ? imps.appBase : imps.pkgBase}/${sub}/${f.replace(/\.ts$/, '')}`
         try {
           const mod = await import(importPath)
@@ -106,26 +123,25 @@ async function loadModuleEntities(entry: ModuleEntry, resolver: PackageResolver)
 }
 
 function getMigrationsPath(entry: ModuleEntry, resolver: PackageResolver): string {
-  const from = entry.from || '@open-mercato/core'
-  let pkgModRoot: string
+  const roots = resolver.getModulePaths(entry)
 
-  if (from === '@open-mercato/core') {
-    pkgModRoot = path.join(resolver.getRootDir(), 'packages/core/src/modules', entry.id)
-  } else if (/^@open-mercato\//.test(from)) {
-    const segs = from.split('/')
-    if (segs.length > 1 && segs[1]) {
-      pkgModRoot = path.join(resolver.getRootDir(), `packages/${segs[1]}/src/modules`, entry.id)
-    } else {
-      pkgModRoot = path.join(resolver.getRootDir(), 'packages/core/src/modules', entry.id)
-    }
-  } else if (from === '@app') {
-    // For @app modules, use the app directory not the monorepo root
-    pkgModRoot = path.join(resolver.getAppDir(), 'src/modules', entry.id)
-  } else {
-    pkgModRoot = path.join(resolver.getRootDir(), 'packages/core/src/modules', entry.id)
+  if (entry.from === '@app') {
+    // @app modules: use src/ (user's TypeScript source)
+    // Normalize to forward slashes for ESM compatibility on Windows
+    return path.join(roots.appBase, 'migrations').replace(/\\/g, '/')
   }
 
-  return path.join(pkgModRoot, 'migrations')
+  // Package modules: in standalone mode, use dist/ (compiled JS) since Node.js
+  // can't run TypeScript from node_modules. In monorepo, use src/ (TypeScript).
+  if (!resolver.isMonorepo()) {
+    // Replace src/modules with dist/modules for standalone apps
+    // Use regex to handle both forward and backslashes
+    const distPath = roots.pkgBase.replace(/[/\\]src[/\\]modules[/\\]/, '/dist/modules/')
+    return path.join(distPath, 'migrations').replace(/\\/g, '/')
+  }
+
+  // Normalize to forward slashes for ESM compatibility on Windows
+  return path.join(roots.pkgBase, 'migrations').replace(/\\/g, '/')
 }
 
 export interface DbOptions {
@@ -153,10 +169,12 @@ export async function dbGenerate(resolver: PackageResolver, options: DbOptions =
     const tableName = `mikro_orm_migrations_${sanitizedModId}`
     validateTableName(tableName)
 
+    const sslConfig = getSslConfig()
     const orm = await MikroORM.init<PostgreSqlDriver>({
       driver: PostgreSqlDriver,
       clientUrl: getClientUrl(),
       loggerFactory: () => createMinimalLogger(),
+      dynamicImportProvider,
       entities,
       migrations: {
         path: migrationsPath,
@@ -174,6 +192,11 @@ export async function dbGenerate(resolver: PackageResolver, options: DbOptions =
         acquireTimeoutMillis: 60000,
         destroyTimeoutMillis: 30000,
       },
+      driverOptions: sslConfig ? {
+        connection: {
+          ssl: sslConfig,
+        },
+      } : undefined,
     })
 
     const migrator = orm.getMigrator() as Migrator
@@ -230,13 +253,17 @@ export async function dbMigrate(resolver: PackageResolver, options: DbOptions = 
     const tableName = `mikro_orm_migrations_${sanitizedModId}`
     validateTableName(tableName)
 
-    // For @app modules, entities may be empty since TypeScript files can't be imported at runtime
-    // Use discovery.warnWhenNoEntities: false to allow running migrations without entities
+    // dbMigrate only runs existing migration files — entities are intentionally
+    // omitted so MikroORM does not compare them against the snapshot and
+    // auto-generate a phantom diff migration (that would duplicate tables
+    // already created by committed migrations).
+    const sslConfig = getSslConfig()
     const orm = await MikroORM.init<PostgreSqlDriver>({
       driver: PostgreSqlDriver,
       clientUrl: getClientUrl(),
       loggerFactory: () => createMinimalLogger(),
-      entities: entities.length ? entities : [],
+      dynamicImportProvider,
+      entities: [],
       discovery: { warnWhenNoEntities: false },
       migrations: {
         path: migrationsPath,
@@ -254,6 +281,11 @@ export async function dbMigrate(resolver: PackageResolver, options: DbOptions = 
         acquireTimeoutMillis: 60000,
         destroyTimeoutMillis: 30000,
       },
+      driverOptions: sslConfig ? {
+        connection: {
+          ssl: sslConfig,
+        },
+      } : undefined,
     })
 
     const migrator = orm.getMigrator() as Migrator
@@ -357,7 +389,7 @@ export async function dbGreenfield(resolver: PackageResolver, options: Greenfiel
   console.log('Dropping per-module migration tables...')
   try {
     const { Client } = await import('pg')
-    const client = new Client({ connectionString: getClientUrl() })
+    const client = new Client({ connectionString: getClientUrl(), ssl: getSslConfig() })
     await client.connect()
     try {
       await client.query('BEGIN')
@@ -387,7 +419,7 @@ export async function dbGreenfield(resolver: PackageResolver, options: Greenfiel
   console.log('Dropping ALL public tables for true greenfield...')
   try {
     const { Client } = await import('pg')
-    const client = new Client({ connectionString: getClientUrl() })
+    const client = new Client({ connectionString: getClientUrl(), ssl: getSslConfig() })
     await client.connect()
     try {
       const res = await client.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'public'`)

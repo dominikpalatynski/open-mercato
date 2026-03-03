@@ -11,7 +11,15 @@ const sidebars: SidebarsConfig = {
     {
       type: "category",
       label: "Installation",
-      items: ["installation/prerequisites", "installation/setup"],
+      items: [
+        "installation/prerequisites",
+        "installation/setup",
+        {
+          type: "link",
+          label: "Standalone App (create-mercato-app)",
+          href: "/customization/standalone-app",
+        },
+      ],
     },
     {
       type: "category",
@@ -95,13 +103,23 @@ const sidebars: SidebarsConfig = {
             "user-guide/workflows/monitoring",
           ],
         },
+        "user-guide/inbox-ops",
         "user-guide/audit-logs",
+        "user-guide/scheduler",
       ],
     },
     {
       type: "category",
       label: "Architecture",
       items: ["architecture/system-overview", "architecture/data-encryption"],
+    },
+    {
+      type: "category",
+      label: "Enterprise Edition",
+      items: [
+        "enterprise/overview",
+        "enterprise/record-locks",
+      ],
     },
     {
       type: "category",
@@ -120,6 +138,7 @@ const sidebars: SidebarsConfig = {
             "api/attachments",
             "api/vector",
             "api/feature-toggles",
+            "api/scheduler",
             {
               type: "category",
               label: "Business Rules",
@@ -150,6 +169,11 @@ const sidebars: SidebarsConfig = {
             "cli/db-migrate",
             "cli/db-greenfield",
           ],
+        },
+        {
+          type: "category",
+          label: "Development Runtime",
+          items: ["cli/dev-ephemeral"],
         },
         {
           type: "category",
@@ -185,12 +209,20 @@ const sidebars: SidebarsConfig = {
           label: "Entities",
           items: ["cli/entities-install"],
         },
+        {
+          type: "category",
+          label: "Integration Testing",
+          items: ["cli/test-integration", "cli/test-ephemeral"],
+        },
+        "cli/scheduler",
+        "cli/eject",
       ],
     },
     {
       type: "category",
       label: "Customization Tutorials",
       items: [
+        "customization/standalone-app",
         "customization/build-first-app",
         "customization/create-first-module",
         "customization/create-inventory-data",
@@ -212,9 +244,21 @@ const sidebars: SidebarsConfig = {
             "framework/modules/overview",
             "framework/modules/routes-and-pages",
             "framework/modules/notifications",
+            "framework/modules/messages",
             "framework/modules/currencies",
             "framework/modules/sales-providers",
             "framework/modules/sales-calculations",
+          ],
+        },
+        {
+          type: "category",
+          label: "Extensibility Directory",
+          items: [
+            "framework/extensibility/index",
+            "framework/extensibility/current-surfaces",
+            "framework/extensibility/umes-phases",
+            "framework/extensibility/integration-enhancements",
+            "framework/extensibility/umes-2-09-roadmap",
           ],
         },
         "framework/commands/overview",
@@ -271,6 +315,13 @@ const sidebars: SidebarsConfig = {
         "framework/feature-toggles/overview",
         {
           type: "category",
+          label: "Security",
+          items: [
+            "framework/security/rate-limiting",
+          ],
+        },
+        {
+          type: "category",
           label: "Runtime",
           items: [
             "framework/runtime/data-engine",
@@ -302,6 +353,14 @@ const sidebars: SidebarsConfig = {
           label: "Operations",
           items: [
             "framework/operations/system-status",
+          ],
+        },
+        "framework/progress/overview",
+        {
+          type: "category",
+          label: "Scheduler",
+          items: [
+            "framework/scheduler/overview",
           ],
         },
       ],

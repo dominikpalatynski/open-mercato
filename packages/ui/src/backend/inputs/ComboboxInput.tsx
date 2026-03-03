@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from 'react'
+import { Button } from '../../primitives/button'
 
 export type ComboboxOption = {
   value: string
@@ -237,17 +238,19 @@ export function ComboboxInput({
       />
 
       {showSuggestions && !disabled && (loading || filteredSuggestions.length > 0) && (
-        <div className="absolute z-50 w-full mt-1 rounded border bg-popover shadow-lg max-h-60 overflow-auto">
+        <div className="absolute z-50 w-full mt-1 rounded border bg-popover shadow-lg max-h-48 sm:max-h-60 overflow-auto">
           {loading && touched ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">Loading suggestions…</div>
           ) : (
             filteredSuggestions.map((option, index) => (
-              <button
+              <Button
                 key={option.value}
                 type="button"
+                variant="ghost"
+                size="sm"
                 className={[
-                  'w-full flex flex-col items-start px-3 py-2 text-sm transition text-left',
-                  index === selectedIndex ? 'bg-accent' : 'hover:bg-muted',
+                  'w-full h-auto justify-start font-normal text-left flex flex-col items-start px-3 py-2',
+                  index === selectedIndex ? 'bg-accent' : '',
                 ]
                   .filter(Boolean)
                   .join(' ')}
@@ -259,7 +262,7 @@ export function ComboboxInput({
                 {option.description ? (
                   <span className="text-xs text-muted-foreground">{option.description}</span>
                 ) : null}
-              </button>
+              </Button>
             ))
           )}
         </div>

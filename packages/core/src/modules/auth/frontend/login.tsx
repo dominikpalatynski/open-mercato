@@ -12,6 +12,7 @@ import { translateWithFallback } from '@open-mercato/shared/lib/i18n/translate'
 import { clearAllOperations } from '@open-mercato/ui/backend/operations/store'
 import { apiCall } from '@open-mercato/ui/backend/utils/apiCall'
 import { X } from 'lucide-react'
+import { Notice } from '@open-mercato/ui/primitives/Notice'
 
 const loginTenantKey = 'om_login_tenant'
 const loginTenantCookieMaxAge = 60 * 60 * 24 * 14
@@ -248,7 +249,7 @@ export default function LoginPage() {
               <input type="hidden" name="tenantId" value={tenantId} />
             ) : null}
             {!!translatedRoles.length && (
-              <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-center text-xs text-blue-900">
+              <Notice compact className="text-center">
                 {translate(
                   translatedRoles.length > 1 ? 'auth.login.requireRolesMessage' : 'auth.login.requireRoleMessage',
                   translatedRoles.length > 1
@@ -256,14 +257,14 @@ export default function LoginPage() {
                     : 'Access requires role: {roles}',
                   { roles: translatedRoles.join(', ') },
                 )}
-              </div>
+              </Notice>
             )}
             {!!translatedFeatures.length && (
-              <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-center text-xs text-blue-900">
+              <Notice compact className="text-center">
                 {translate('auth.login.featureDenied', "You don't have access to this feature ({feature}). Please contact your administrator.", {
                   feature: translatedFeatures.join(', '),
                 })}
-              </div>
+              </Notice>
             )}
             {showTenantInvalid ? (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-center text-xs text-red-700">
@@ -305,9 +306,9 @@ export default function LoginPage() {
               <input type="checkbox" name="remember" className="accent-foreground" />
               <span>{translate('auth.login.rememberMe', 'Remember me')}</span>
             </label>
-            <button disabled={submitting} className="h-10 rounded-md bg-foreground text-background mt-2 hover:opacity-90 transition disabled:opacity-60">
+            <Button type="submit" className="mt-2 w-full" disabled={submitting}>
               {submitting ? translate('auth.login.loading', 'Loading...') : translate('auth.signIn', 'Sign in')}
-            </button>
+            </Button>
             <div className="text-xs text-muted-foreground mt-2">
               <Link className="underline" href="/reset">
                 {translate('auth.login.forgotPassword', 'Forgot password?')}
