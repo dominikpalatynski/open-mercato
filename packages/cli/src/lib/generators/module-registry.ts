@@ -245,7 +245,7 @@ function processSubscribers(options: {
     imports.push(`import ${importName}, * as ${metaName} from '${importPath}'`)
     const sid = [modId, ...segs, name].filter(Boolean).join(':')
     subscribers.push(
-      `{ id: (((${metaName}.metadata) as any)?.id || '${sid}'), event: ((${metaName}.metadata) as any)?.event, persistent: ((${metaName}.metadata) as any)?.persistent, handler: ${importName} }`
+      `{ id: (((${metaName}.metadata) as any)?.id || '${sid}'), event: ((${metaName}.metadata) as any)?.event, persistent: ((${metaName}.metadata) as any)?.persistent, sync: ((${metaName}.metadata) as any)?.sync, priority: ((${metaName}.metadata) as any)?.priority, handler: ${importName} }`
     )
   }
   return subscribers
@@ -391,6 +391,8 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
   const notificationsChecksumFile = path.join(outputDir, 'notifications.generated.checksum')
   const notificationsClientOutFile = path.join(outputDir, 'notifications.client.generated.ts')
   const notificationsClientChecksumFile = path.join(outputDir, 'notifications.client.generated.checksum')
+  const notificationHandlersOutFile = path.join(outputDir, 'notification-handlers.generated.ts')
+  const notificationHandlersChecksumFile = path.join(outputDir, 'notification-handlers.generated.checksum')
   const messageTypesOutFile = path.join(outputDir, 'message-types.generated.ts')
   const messageTypesChecksumFile = path.join(outputDir, 'message-types.generated.checksum')
   const messageObjectsOutFile = path.join(outputDir, 'message-objects.generated.ts')
@@ -407,8 +409,16 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
   const transFieldsChecksumFile = path.join(outputDir, 'translations-fields.generated.checksum')
   const enrichersOutFile = path.join(outputDir, 'enrichers.generated.ts')
   const enrichersChecksumFile = path.join(outputDir, 'enrichers.generated.checksum')
+  const interceptorsOutFile = path.join(outputDir, 'interceptors.generated.ts')
+  const interceptorsChecksumFile = path.join(outputDir, 'interceptors.generated.checksum')
+  const componentOverridesOutFile = path.join(outputDir, 'component-overrides.generated.ts')
+  const componentOverridesChecksumFile = path.join(outputDir, 'component-overrides.generated.checksum')
   const inboxActionsOutFile = path.join(outputDir, 'inbox-actions.generated.ts')
   const inboxActionsChecksumFile = path.join(outputDir, 'inbox-actions.generated.checksum')
+  const guardsOutFile = path.join(outputDir, 'guards.generated.ts')
+  const guardsChecksumFile = path.join(outputDir, 'guards.generated.checksum')
+  const commandInterceptorsOutFile = path.join(outputDir, 'command-interceptors.generated.ts')
+  const commandInterceptorsChecksumFile = path.join(outputDir, 'command-interceptors.generated.checksum')
 
   const enabled = resolver.loadEnabledModules()
   const imports: string[] = []
@@ -426,6 +436,8 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
   const notificationImports: string[] = []
   const notificationClientTypes: string[] = []
   const notificationClientImports: string[] = []
+  const notificationHandlerEntries: string[] = []
+  const notificationHandlerImports: string[] = []
   const messageTypeEntries: string[] = []
   const messageTypeImports: string[] = []
   const messageObjectTypeEntries: string[] = []
@@ -440,8 +452,16 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
   const transFieldsImports: string[] = []
   const enricherConfigs: string[] = []
   const enricherImports: string[] = []
+  const interceptorConfigs: string[] = []
+  const interceptorImports: string[] = []
+  const componentOverrideConfigs: string[] = []
+  const componentOverrideImports: string[] = []
   const inboxActionsConfigs: string[] = []
   const inboxActionsImports: string[] = []
+  const guardConfigs: string[] = []
+  const guardImports: string[] = []
+  const commandInterceptorConfigs: string[] = []
+  const commandInterceptorImports: string[] = []
 
   for (const entry of enabled) {
     const modId = entry.id
@@ -571,6 +591,15 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
       standaloneConfigs: notificationClientTypes,
       configExpr: (n, id) => `{ moduleId: '${id}', types: (${n}.default ?? []) }`,
     })
+
+    processStandaloneConfig({
+      roots, imps, modId, importIdRef,
+      relativePath: 'notifications.handlers.ts',
+      prefix: 'NOTIF_HANDLERS',
+      standaloneImports: notificationHandlerImports,
+      standaloneConfigs: notificationHandlerEntries,
+      configExpr: (n, id) => `{ moduleId: '${id}', handlers: ((${n}.default ?? ${n}.notificationHandlers ?? []) as NotificationHandler[]) }`,
+    })
     // Message types: module root message-types.ts
     {
       const resolved = resolveModuleFile(roots, imps, 'message-types.ts')
@@ -652,6 +681,26 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
       configExpr: (n, id) => `{ moduleId: '${id}', enrichers: ((${n} as any).enrichers ?? (${n} as any).default ?? []) }`,
     })
 
+    // 10c. API interceptors: api/interceptors.ts
+    processStandaloneConfig({
+      roots, imps, modId, importIdRef,
+      relativePath: 'api/interceptors.ts',
+      prefix: 'INTERCEPTORS',
+      standaloneImports: interceptorImports,
+      standaloneConfigs: interceptorConfigs,
+      configExpr: (n, id) => `{ moduleId: '${id}', interceptors: ((${n} as any).interceptors ?? (${n} as any).default ?? []) }`,
+    })
+
+    // 10d. Component overrides: widgets/components.ts
+    processStandaloneConfig({
+      roots, imps, modId, importIdRef,
+      relativePath: 'widgets/components.ts',
+      prefix: 'COMPONENT_OVERRIDES',
+      standaloneImports: componentOverrideImports,
+      standaloneConfigs: componentOverrideConfigs,
+      configExpr: (n, id) => `{ moduleId: '${id}', componentOverrides: ((${n} as any).componentOverrides ?? (${n} as any).default ?? []) }`,
+    })
+
     // Translatable fields: translations.ts (also referenced in module declarations)
     let transFieldsImportName: string | null = null
     transFieldsImportName = processStandaloneConfig({
@@ -676,6 +725,26 @@ export async function generateModuleRegistry(options: ModuleRegistryOptions): Pr
         )
       }
     }
+
+    // 10e. Mutation guards: data/guards.ts
+    processStandaloneConfig({
+      roots, imps, modId, importIdRef,
+      relativePath: 'data/guards.ts',
+      prefix: 'GUARDS',
+      standaloneImports: guardImports,
+      standaloneConfigs: guardConfigs,
+      configExpr: (n, id) => `{ moduleId: '${id}', guards: ((${n} as any).guards ?? (${n} as any).default ?? []) }`,
+    })
+
+    // 10f. Command interceptors: commands/interceptors.ts
+    processStandaloneConfig({
+      roots, imps, modId, importIdRef,
+      relativePath: 'commands/interceptors.ts',
+      prefix: 'CMD_INTERCEPTORS',
+      standaloneImports: commandInterceptorImports,
+      standaloneConfigs: commandInterceptorConfigs,
+      configExpr: (n, id) => `{ moduleId: '${id}', interceptors: ((${n} as any).interceptors ?? (${n} as any).default ?? []) }`,
+    })
 
     // 11. Setup: setup.ts
     {
@@ -1001,6 +1070,16 @@ export function getNotificationRenderers(): NotificationRenderers {
 }
 `
 
+  const notificationHandlersEntriesLiteral = notificationHandlerEntries.join(',\n  ')
+  const notificationHandlersImportSection = notificationHandlerImports.join('\n')
+  const notificationHandlersOutput = `// AUTO-GENERATED by mercato generate registry
+import type { NotificationHandler } from '@open-mercato/shared/modules/notifications/handler'
+${notificationHandlersImportSection ? `\n${notificationHandlersImportSection}\n` : '\n'}type NotificationHandlerEntry = { moduleId: string; handlers: NotificationHandler[] }
+
+export const notificationHandlerEntries: NotificationHandlerEntry[] = [
+${notificationHandlersEntriesLiteral ? `  ${notificationHandlersEntriesLiteral}\n` : ''}]
+`
+
   const messageTypeEntriesLiteral = messageTypeEntries.join(',\n  ')
   const messageTypeImportSection = messageTypeImports.join('\n')
   const messageTypesOutput = `// AUTO-GENERATED by mercato generate registry
@@ -1211,6 +1290,7 @@ export const allAiTools = aiToolConfigEntries.flatMap(e => e.tools)
   writeGeneratedFile({ outFile: aiToolsOutFile, checksumFile: aiToolsChecksumFile, content: aiToolsOutput, structureChecksum, result, quiet })
   writeGeneratedFile({ outFile: notificationsOutFile, checksumFile: notificationsChecksumFile, content: notificationsOutput, structureChecksum, result, quiet })
   writeGeneratedFile({ outFile: notificationsClientOutFile, checksumFile: notificationsClientChecksumFile, content: notificationsClientOutput, structureChecksum, result, quiet })
+  writeGeneratedFile({ outFile: notificationHandlersOutFile, checksumFile: notificationHandlersChecksumFile, content: notificationHandlersOutput, structureChecksum, result, quiet })
   writeGeneratedFile({ outFile: messageTypesOutFile, checksumFile: messageTypesChecksumFile, content: messageTypesOutput, structureChecksum, result, quiet })
   writeGeneratedFile({ outFile: messageObjectsOutFile, checksumFile: messageObjectsChecksumFile, content: messageObjectsOutput, structureChecksum, result, quiet })
   writeGeneratedFile({ outFile: messagesClientOutFile, checksumFile: messagesClientChecksumFile, content: messagesClientOutput, structureChecksum, result, quiet })
@@ -1254,6 +1334,57 @@ export function getRegisteredActionTypes(): string[] {
 }
 `
   writeGeneratedFile({ outFile: inboxActionsOutFile, checksumFile: inboxActionsChecksumFile, content: inboxActionsOutput, structureChecksum, result, quiet })
+
+  const interceptorEntriesLiteral = interceptorConfigs.join(',\n  ')
+  const interceptorImportSection = interceptorImports.join('\n')
+  const interceptorsOutput = `// AUTO-GENERATED by mercato generate registry
+import type { ApiInterceptor } from '@open-mercato/shared/lib/crud/api-interceptor'
+${interceptorImportSection ? `\n${interceptorImportSection}\n` : '\n'}type InterceptorEntry = { moduleId: string; interceptors: ApiInterceptor[] }
+
+export const interceptorEntries: InterceptorEntry[] = [
+${interceptorEntriesLiteral ? `  ${interceptorEntriesLiteral}\n` : ''}]
+`
+  writeGeneratedFile({ outFile: interceptorsOutFile, checksumFile: interceptorsChecksumFile, content: interceptorsOutput, structureChecksum, result, quiet })
+
+  const componentOverrideEntriesLiteral = componentOverrideConfigs.join(',\n  ')
+  const componentOverrideImportSection = componentOverrideImports.join('\n')
+  const componentOverridesOutput = `// AUTO-GENERATED by mercato generate registry
+import type { ComponentOverride } from '@open-mercato/shared/modules/widgets/component-registry'
+${componentOverrideImportSection ? `\n${componentOverrideImportSection}\n` : '\n'}type ComponentOverrideEntry = { moduleId: string; componentOverrides: ComponentOverride[] }
+
+export const componentOverrideEntries: ComponentOverrideEntry[] = [
+${componentOverrideEntriesLiteral ? `  ${componentOverrideEntriesLiteral}\n` : ''}]
+`
+  writeGeneratedFile({
+    outFile: componentOverridesOutFile,
+    checksumFile: componentOverridesChecksumFile,
+    content: componentOverridesOutput,
+    structureChecksum,
+    result,
+    quiet,
+  })
+
+  const guardEntriesLiteral = guardConfigs.join(',\n  ')
+  const guardImportSection = guardImports.join('\n')
+  const guardsOutput = `// AUTO-GENERATED by mercato generate registry
+import type { MutationGuard } from '@open-mercato/shared/lib/crud/mutation-guard-registry'
+${guardImportSection ? `\n${guardImportSection}\n` : '\n'}type GuardEntry = { moduleId: string; guards: MutationGuard[] }
+
+export const guardEntries: GuardEntry[] = [
+${guardEntriesLiteral ? `  ${guardEntriesLiteral}\n` : ''}]
+`
+  writeGeneratedFile({ outFile: guardsOutFile, checksumFile: guardsChecksumFile, content: guardsOutput, structureChecksum, result, quiet })
+
+  const commandInterceptorEntriesLiteral = commandInterceptorConfigs.join(',\n  ')
+  const commandInterceptorImportSection = commandInterceptorImports.join('\n')
+  const commandInterceptorsOutput = `// AUTO-GENERATED by mercato generate registry
+import type { CommandInterceptor } from '@open-mercato/shared/lib/commands/command-interceptor'
+${commandInterceptorImportSection ? `\n${commandInterceptorImportSection}\n` : '\n'}type CommandInterceptorEntry = { moduleId: string; interceptors: CommandInterceptor[] }
+
+export const commandInterceptorEntries: CommandInterceptorEntry[] = [
+${commandInterceptorEntriesLiteral ? `  ${commandInterceptorEntriesLiteral}\n` : ''}]
+`
+  writeGeneratedFile({ outFile: commandInterceptorsOutFile, checksumFile: commandInterceptorsChecksumFile, content: commandInterceptorsOutput, structureChecksum, result, quiet })
 
   return result
 }
