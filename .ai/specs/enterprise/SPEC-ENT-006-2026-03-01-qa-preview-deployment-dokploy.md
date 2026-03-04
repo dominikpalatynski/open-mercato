@@ -1,30 +1,30 @@
-# SPEC-ENT-006: QA Preview Deployment on Dokploy
+# SPEC-ENT-006: QA Deployment on Dokploy via GitHub Actions
 
 ## TLDR
 
 **Key Points:**
-- Introduce a `preview` Docker build target and wire Dokploy's native GitHub webhook integration to deploy a per-PR ephemeral Open Mercato environment automatically when a PR targeting `develop` is labelled `preview-env`.
-- Each PR preview runs at a unique subdomain under `*.openmercato.com` (Dokploy-generated via Traefik). The environment spins up its own ephemeral PostgreSQL container via Docker-in-Docker (docker.sock mount) and resets on every deployment.
+- Introduce a manual `workflow_dispatch` GitHub Actions workflow (`.github/workflows/qa.yml`) that builds the preview Docker image, pushes it to GHCR, and deploys it to a named QA slot on Dokploy via REST API.
+- Each QA slot (e.g. `qa1`) maps to a pre-configured Dokploy application running as a Docker-provider app. Slots are long-lived environments, not ephemeral per-PR.
+- The workflow can be triggered manually from the GitHub Actions UI for any branch, tag, or SHA.
 
 **Scope:**
-- New `preview` stage in `Dockerfile`
-- Verify `docker/scripts/preview-entrypoint.sh` works in baked-image (no volume mount) Dokploy context
-- Verify `yarn test:integration:ephemeral:start` path correctly builds and starts
-- Dokploy application configuration
-- Wildcard DNS record `*.openmercato.com` → Dokploy server IP
+- `.github/workflows/qa.yml` — manual deployment workflow
+- `docker/preview/Dockerfile` — dedicated preview image used for QA builds
+- `docker/preview/preview-entrypoint.sh` — baked into the image; invokes `yarn test:integration:ephemeral:start`
+- Fix `NODE_ENV` passthrough in `packages/cli/src/lib/testing/integration.ts`
+- Dokploy application configuration (Docker provider, not GitHub source)
+- GitHub repository secrets and variables for GHCR + Dokploy API
 
 **Concerns:**
-- docker.sock mount gives the container access to the host Docker daemon — a known privilege escalation vector. Acceptable for an internal QA environment; must not be used in production.
-- `yarn initialize --reinstall` runs on every container startup (full build + DB migration), meaning first-ready latency is ~5–10 minutes per deployment.
-- Concurrent PRs labelled `preview-env` each get their own Dokploy preview instance — resource usage scales linearly with open PRs. Set a concurrency cap in Dokploy settings.
+- docker.sock mount gives the Dokploy container access to the host Docker daemon — acceptable for internal QA; must not be used in production.
+- First-ready latency is ~5–10 minutes per deployment (full install → generate → build → DB init → Next.js start).
+- Concurrent slot deployments are serialised per slot via GitHub Actions `concurrency` group (`cancel-in-progress: false`). A second run for the same slot queues behind the first.
 
 ---
 
 ## Overview
 
-Open Mercato currently has no automated QA preview environment. Developers and reviewers must run the full stack locally or share a single staging environment. This spec introduces per-PR ephemeral preview deployments: when a pull request targeting `develop` is labelled `preview-env`, Dokploy's native GitHub webhook integration automatically builds and deploys the branch to a unique `*.qa.openmercato.com` subdomain. The environment is fully self-contained — it includes its own PostgreSQL container, initialises from scratch, and is torn down when the PR is closed or the label is removed.
-
-> **Market Reference**: Vercel's Preview Deployments (per-branch ephemeral URLs) and Railway's PR environments were studied. The ephemeral-postgres-per-deploy pattern is adopted from both. Vercel's approach is rejected because it requires managed infrastructure and does not support custom Docker targets. Railway is rejected for cost unpredictability at scale. Dokploy's open-source self-hosted model is chosen for full infrastructure control.
+Open Mercato has no automated QA preview environment. Developers must run the full stack locally or share a single staging server. This spec introduces named QA slot deployments: a developer manually triggers the `Deploy to Dokploy QA` workflow from the GitHub Actions UI, selects a slot (`qa1`), optionally specifies a branch/tag/SHA and an image tag override, and the workflow builds the preview image, pushes it to GHCR, updates the Dokploy application's Docker image, and triggers a redeploy. The environment uses an ephemeral PostgreSQL container (docker.sock) and resets on every deployment.
 
 ---
 
@@ -32,227 +32,258 @@ Open Mercato currently has no automated QA preview environment. Developers and r
 
 - No automated QA environment exists. Testing a PR requires local setup or a shared staging server that gets overwritten.
 - Reviewers cannot verify a feature without checking out the branch locally.
-- Shared staging environments cause race conditions and unclear ownership.
-- Setting up the full stack locally (Docker, DB, env files) takes 20–30 minutes for new contributors.
+- Setting up the full stack locally takes 20–30 minutes for new contributors.
 
 ---
 
 ## Proposed Solution
 
-A `preview` Docker build stage is introduced in the `Dockerfile`. Dokploy's GitHub App is installed on the repository and configured to listen for PR webhook events targeting `develop`. When a PR is labelled `preview-env`:
+A manually-triggered GitHub Actions workflow builds and deploys the `docker/preview/Dockerfile` image to a pre-configured Dokploy slot. The workflow:
 
-1. GitHub delivers a `pull_request` webhook event (type: `labeled`) to Dokploy.
-2. Dokploy creates a preview application for the PR, builds the image using the `qa` Dockerfile target from the PR branch, and assigns a unique subdomain under `*.openmercato.com` via Traefik.
-3. The container starts with docker.sock mounted. `preview-entrypoint.sh` invokes `yarn test:integration:ephemeral:start`, which: installs deps, generates module files, builds packages twice (pre/post generate), starts an ephemeral PostgreSQL container via the mounted docker.sock, runs `yarn initialize --reinstall`, builds the Next.js app, and serves it via `yarn start`.
-4. Dokploy posts the generated preview URL as a commit status or PR comment via its GitHub integration.
-5. When the PR is closed, GitHub delivers a `pull_request` webhook event (type: `closed`) to Dokploy, which stops and removes the preview application automatically.
+1. Checks out the requested ref (branch / tag / SHA; defaults to the triggering branch).
+2. Builds the preview Docker image using `docker/preview/Dockerfile` via `docker/build-push-action` with GitHub Actions cache (`type=gha`).
+3. Pushes the image to GHCR as `ghcr.io/<org>/<repo>:<slot>-<sha7>` (or a custom tag override).
+4. Calls the Dokploy REST API (`application.saveDockerProvider`) to update the application's Docker image reference to the newly pushed tag.
+5. Calls the Dokploy REST API (`application.deploy`) to trigger a redeploy of the slot.
+
+The Dokploy application is configured as a **Docker provider** app (not a GitHub source app), so Dokploy pulls the already-built image from GHCR rather than building it itself.
 
 ### Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| Separate `preview` Dockerfile stage (not reuse `dev`) | `dev` is semantically tied to local hot-reload workflows with volume mounts. `preview` is for Dokploy baked-image deployments. Keeping them separate avoids accidental breakage. |
-| Ephemeral PostgreSQL via docker.sock, not a Dokploy service | Matches existing `test:integration:ephemeral:start` infrastructure; zero additional Dokploy service config. Acceptable for QA. |
-| Ephemeral DB (reset on every deploy) | Consistent with `test:integration:ephemeral:start` design; seeded demo data always present, no state drift between deployments. |
-| Dokploy native GitHub webhook (no external CI intermediary) | All deployment logic lives in Dokploy. No external CI configuration required. PR label events flow directly from GitHub → Dokploy webhook → build and deploy. |
-| `*.openmercato.com` wildcard subdomain | Lets Dokploy assign unique per-PR URLs without manual DNS changes per PR. One-time DNS setup. |
-| Secrets via Dokploy env management UI | Secrets stay in Dokploy, not in GitHub. Reduces blast radius if GitHub is compromised. |
+| Manual `workflow_dispatch` (not automatic webhook/label trigger) | Full developer control over when and what gets deployed to QA. Avoids race conditions from concurrent label events on multiple PRs. |
+| Pre-build image in CI, push to GHCR, then tell Dokploy | Decouples build from deployment. CI has access to build cache (`type=gha`); Dokploy does not need GitHub App access. Cleaner separation of concerns. |
+| Named slots (`qa1`, `qa2`) instead of per-PR ephemeral URLs | Predictable URLs, predictable resource usage, easier to share with stakeholders. Slots are long-lived Dokploy applications. |
+| Dokploy REST API (`saveDockerProvider` + `deploy`) | No Dokploy GitHub App installation required. Works with any Git hosting or manual trigger. Simpler ops. |
+| `slot-<sha7>` default image tag | Uniquely identifies the deployed build without manual tag management. Override available for rollbacks. |
+| `cancel-in-progress: false` concurrency | Queues concurrent deploys to the same slot rather than cancelling in-flight builds; prevents partial deployments. |
+| Standalone `docker/preview/Dockerfile` | Keeps preview tooling (docker-cli, jest config) isolated from the main production `Dockerfile`. |
 
 ### Alternatives Considered
 
 | Alternative | Why Rejected |
 |-------------|-------------|
-| Single shared `qa.openmercato.com` URL | Concurrent PRs overwrite each other. Unclear which PR is deployed. |
-| External CI (GitHub Actions / CircleCI) triggering Dokploy API | Introduces an unnecessary intermediary. Dokploy's native GitHub integration handles this directly. |
-| Persistent PostgreSQL between deploys | State drift makes tests non-deterministic. Adds cleanup complexity. |
+| Dokploy native GitHub webhook (per-PR label trigger) | More complex to configure, requires Dokploy GitHub App installation, harder to control. Manual trigger is sufficient for QA. |
+| Single shared `qa.openmercato.com` with Dokploy GitHub source | Concurrent deploys overwrite each other; no image caching across builds. |
+| Persistent PostgreSQL between deploys | State drift makes tests non-deterministic. Ephemeral DB is consistent with existing `test:integration:ephemeral:start` design. |
 
 ---
 
 ## User Stories / Use Cases
 
-- **Reviewer** wants to open a PR preview URL directly from the GitHub PR page so that they can test the feature without cloning the branch locally.
-- **Developer** wants the QA environment to deploy automatically when they add the `preview-env` label so that they don't have to trigger it manually.
-- **DevOps** wants the QA environment to be torn down automatically when the PR is closed so that orphaned containers do not consume server resources.
-- **Developer** wants to see the preview URL as a GitHub commit status so that they can share it with stakeholders.
+- **Developer** wants to deploy a specific branch to QA manually so that a reviewer can test the feature at a stable URL without cloning the repo.
+- **Developer** wants to override the image tag so that they can redeploy a previously built image for a rollback.
+- **Reviewer** wants to know the QA slot URL in advance so that they can open it directly from a shared link.
+- **DevOps** wants deployments to a slot to be serialised so that a second trigger does not corrupt a running deployment.
 
 ---
 
 ## Architecture
 
 ```
-GitHub PR (develop target) + label: preview-env
-    │
-    │  pull_request webhook (labeled / synchronize / closed)
+Developer triggers workflow_dispatch
+    │  inputs: slot=qa1, ref=<branch/sha>, image_tag=<optional>
     ▼
-[Dokploy Server]  ← *.qa.openmercato.com  DNS A record
+[GitHub Actions: .github/workflows/qa.yml]
     │
-    ├── On: labeled / synchronize (label=preview-env present)
-    │       │
-    │       ├── docker build --target preview . (PR branch)
-    │       │       └── Packages built (yarn build:packages)
-    │       │           preview-entrypoint.sh baked in
-    │       │
-    │       └── docker run
-    │               ├── /var/run/docker.sock:/var/run/docker.sock (bind volume)
-    │               ├── ENV from Dokploy UI
-    │               └── preview-entrypoint.sh
-    │                       └── yarn test:integration:ephemeral:start
-    │                               ├── yarn install
-    │                               ├── yarn build:packages
-    │                               ├── yarn generate
-    │                               ├── yarn build:packages (2nd pass)
-    │                               ├── docker run postgres:16 (via docker.sock)
-    │                               ├── yarn initialize --reinstall
-    │                               ├── yarn build:app
-    │                               └── yarn start  (PORT=3000)
+    ├── Checkout ref
     │
-    └── On: closed
-            └── Dokploy removes preview container + app automatically
+    ├── docker/build-push-action
+    │       file: docker/preview/Dockerfile
+    │       context: .
+    │       push: true
+    │       platforms: linux/amd64
+    │       tags: ghcr.io/<org>/<repo>:<slot>-<sha7>
+    │       cache-from/to: type=gha
+    │
+    ├── POST /api/application.saveDockerProvider
+    │       { applicationId, dockerImage: "ghcr.io/...:<tag>" }
+    │
+    └── POST /api/application.deploy
+            { applicationId }
+                │
+                ▼
+        [Dokploy Server]
+            └── docker pull ghcr.io/...:<tag>
+            └── docker run
+                    ├── /var/run/docker.sock:/var/run/docker.sock (bind)
+                    ├── ENV from Dokploy UI
+                    └── docker/preview/preview-entrypoint.sh
+                            └── yarn test:integration:ephemeral:start
+                                    ├── yarn install
+                                    ├── yarn build:packages
+                                    ├── yarn generate
+                                    ├── yarn build:packages (2nd pass)
+                                    ├── docker run postgres:16 (via docker.sock)
+                                    ├── yarn initialize --reinstall
+                                    ├── yarn build:app
+                                    └── yarn start  (PORT=3000)
 ```
 
-### Domain Resolution
+### Slot → Application ID Mapping
 
-```
-DNS: *.openmercato.com  →  A  →  {Dokploy server IP}
+The workflow resolves the Dokploy `applicationId` from GitHub repository variables:
 
-Dokploy Traefik generates per-PR subdomain:
-  preview-{appName}-{uniqueId}.openmercato.com
-      │
-      └── Reverse-proxied to container port 5000
-```
+| Slot | Variable |
+|------|----------|
+| `qa1` | `vars.DOKPLOY_APP_ID_QA1` |
+| `qa2` | `vars.DOKPLOY_APP_ID_QA2` |
 
 ---
 
 ## Data Models
 
-This spec introduces no database entities. Deployment state is managed entirely by Dokploy.
+No new database entities. Deployment state is managed entirely by Dokploy.
 
 ---
 
 ## API Contracts
 
-No new application API endpoints. The integration relies entirely on Dokploy's GitHub App receiving standard GitHub webhook payloads (`pull_request` events).
+### Dokploy REST API calls (outbound from GitHub Actions)
+
+**`POST /api/application.saveDockerProvider`**
+```json
+{
+  "applicationId": "<string>",
+  "dockerImage": "ghcr.io/<org>/<repo>:<tag>"
+}
+```
+
+**`POST /api/application.deploy`**
+```json
+{
+  "applicationId": "<string>"
+}
+```
+
+Both calls require `x-api-key: <DOKPLOY_API_KEY>` and `Content-Type: application/json`.
 
 ---
 
 ## Configuration
 
-### Required Dokploy Application Settings
+### GitHub Repository Secrets
+
+| Secret | Description |
+|--------|-------------|
+| `DOKPLOY_URL` | Base URL of the Dokploy server (e.g. `https://dokploy.example.com`) |
+| `DOKPLOY_API_KEY` | Dokploy API key with deploy permissions |
+
+### GitHub Repository Variables
+
+| Variable | Description |
+|----------|-------------|
+| `DOKPLOY_APP_ID_QA1` | Dokploy `applicationId` for the `qa1` slot |
+| `DOKPLOY_APP_ID_QA2` | Dokploy `applicationId` for the `qa2` slot (optional) |
+
+### GitHub Actions Permissions (workflow-level)
+
+```yaml
+permissions:
+  contents: read
+  packages: write   # required to push to GHCR
+```
+
+### Required Dokploy Application Settings (per slot)
 
 | Setting | Value |
 |---------|-------|
-| Source | GitHub — `open-mercato` repo |
-| Branch | PR branch (resolved dynamically by Dokploy per preview) |
-| Dockerfile | `./Dockerfile` |
-| Build target | `preview` |
+| Source type | Docker (not GitHub) |
+| Docker image | `ghcr.io/<org>/<repo>:<latest-deployed-tag>` (updated by workflow) |
 | Exposed port | `3000` |
 | Volume — Source | `/var/run/docker.sock` |
 | Volume — Destination | `/var/run/docker.sock` |
 | Volume — Type | Bind |
-| Restart policy | `no` (ephemeral; container should not restart on exit) |
-| Preview domain | `*.openmercato.com` |
-| Preview trigger | PR label: `preview-env` (configure in Dokploy preview settings) |
-| Max concurrent previews | `3` (configure in Dokploy to cap resource usage) |
-
-### Required Dokploy Environment Variables (set in Dokploy UI)
-
-| Variable | Value | Description |
-|----------|-------|-------------|
-| `NODE_ENV` | `production` | Runtime mode |
-| Additional app-specific secrets | — | As required by `apps/mercato/.env.example` |
+| Restart policy | `no` |
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Dockerfile `qa` Stage
+### Phase 1: Standalone Preview Dockerfile ✅
 
-**Goal**: Add a `preview` build target to the Dockerfile, structurally identical to `dev` but semantically distinct for Dokploy preview deployments.
+**Goal**: Create a dedicated `docker/preview/Dockerfile` for QA builds, fully isolated from the main `Dockerfile`.
 
 #### Steps
 
-1. **Add `preview` stage to `Dockerfile`** — insert after the existing `dev` stage:
+1. **Create `docker/preview/Dockerfile`** — two-stage build (`builder` + `runner`):
+   - `builder` stage: installs deps and runs `yarn build:packages`
+   - `runner` stage: installs `docker-cli` (needed to spawn the ephemeral PostgreSQL container via docker.sock), copies the entrypoint script, runs `yarn install` + `yarn build:packages`
 
+2. **Create `docker/preview/preview-entrypoint.sh`** — baked into the `runner` stage; calls `yarn test:integration:ephemeral:start`.
 
-2. **Verify local build** — `docker build -t open-mercato:dev --target preview .` — must complete without errors.
+3. **Verify local build** — `docker build -f docker/preview/Dockerfile -t open-mercato:preview .` — must complete without errors.
 
 #### File Manifest
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `Dockerfile` | Modify | Add `preview` stage after `dev` stage |
+| `docker/preview/Dockerfile` | Create | Standalone preview image (builder + runner stages) |
+| `docker/preview/preview-entrypoint.sh` | Create | Entrypoint that invokes `yarn test:integration:ephemeral:start` |
 
 ---
 
-### Phase 2: Verify Ephemeral Production Startup
+### Phase 2: Fix NODE_ENV Passthrough ✅
 
-**Goal**: Confirm that `preview-entrypoint.sh` and `scripts/dev-ephemeral.ts --production` work correctly when the Docker image has code baked in (no volume mounts — Dokploy context).
+**Goal**: Confirm that `yarn test:integration:ephemeral:start` inherits `NODE_ENV=production` from the container environment.
 
 #### Steps
 
-1. **Review `docker/scripts/preview-entrypoint.sh`** — confirm it calls `yarhn test:integration:ephemeral:start`.
-
-2. **Local smoke test** — run:
-   ```bash
-   docker build -t open-mercato:dev --target preview .
-   docker run -p 3000:3000 \
-     -v /var/run/docker.sock:/var/run/docker.sock \
-     -e NEXTAUTH_SECRET=test-secret \
-     -e DEV_EPHEMERAL_PREFERRED_PORT=3000 \
-     -e DEV_EPHEMERAL_POSTGRES_PUBLISHED_HOST=0.0.0.0 \
-     -e DEV_EPHEMERAL_POSTGRES_CONNECT_HOST=host.docker.internal \
-     open-mercato:qa
-   ```
-   Confirm the app becomes accessible at `http://localhost:3000/backend` within 10 minutes.
+1. **Fix `NODE_ENV` passthrough in `packages/cli/src/lib/testing/integration.ts`** — change the two hardcoded `NODE_ENV: 'test'` assignments to `NODE_ENV: process.env.NODE_ENV ?? 'test'`. This allows the ephemeral environment to inherit `NODE_ENV=production` set in the Dokploy container, while still defaulting to `'test'` in CI/local runs.
 
 #### File Manifest
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `package.json` (root) | Verify / add | `preview:ephemeral` script must exist |
+| `packages/cli/src/lib/testing/integration.ts` | Modify | `NODE_ENV: process.env.NODE_ENV ?? 'test'` (two occurrences) |
 
 ---
 
-### Phase 4: Dokploy Application & GitHub Webhook Configuration
+### Phase 3: GitHub Actions Workflow ✅
 
-**Goal**: Create and configure the QA preview application in Dokploy, and connect it to the GitHub repository via Dokploy's native GitHub webhook integration. This phase is a manual ops runbook.
+**Goal**: Create `.github/workflows/qa.yml` implementing the manual build-push-deploy pipeline.
 
 #### Steps
 
-1. **Install Dokploy GitHub App** on the `open-mercato` repository:
-   - In Dokploy: Settings → Git → GitHub → Install App
-   - Grant access to the `open-mercato` repository
-   - Dokploy registers a webhook on the repository that receives `pull_request` events
+1. **Create `.github/workflows/qa.yml`** with:
+   - Trigger: `workflow_dispatch` with inputs `slot`, `ref`, `image_tag`
+   - Concurrency: `dokploy-<slot>`, `cancel-in-progress: false`
+   - Steps: checkout → QEMU → Buildx → GHCR login → compute tags → build+push → resolve app ID → `saveDockerProvider` → `deploy` → summary
 
-2. **Create a new Application** in Dokploy:
-   - Name: `open-mercato-qa`
-   - Source: GitHub → `open-mercato` repo → branch `develop` (base; overridden per PR preview)
-   - Build type: `Dockerfile`
-   - Dockerfile path: `./Dockerfile`
-   - Build target: `preview`
+2. **Add required secrets** to the GitHub repository: `DOKPLOY_URL`, `DOKPLOY_API_KEY`.
 
-3. **Enable Preview Deployments** in the application settings:
-   - Navigate to application → Preview Deployments
-   - Enable: On
-   - Base branch: `develop`
-   - Label filter: `preview-env` (Dokploy will only create previews for PRs with this label)
-   - Preview domain: `*.preview.openmercato.com`
-   - Max concurrent previews: `3`
+3. **Add required variables** to the GitHub repository: `DOKPLOY_APP_ID_QA1`.
 
-   > Dokploy will generate unique subdomains following the pattern `preview-{appName}-{uniqueId}.openmercato.com` via Traefik. HTTPS is handled automatically using the wildcard Let's Encrypt certificate configured in Traefik (requires DNS-01 challenge for the wildcard).
+#### File Manifest
 
-4. **Add volume mount** (docker.sock):
+| File | Action | Purpose |
+|------|--------|---------|
+| `.github/workflows/qa.yml` | Create | Manual QA deployment workflow |
+
+---
+
+### Phase 4: Dokploy Application Configuration
+
+**Goal**: Create and configure the QA slot application(s) in Dokploy. This phase is a manual ops runbook.
+
+#### Steps
+
+1. **Create a new Application** in Dokploy for each slot:
+   - Name: `open-mercato-qa1` (repeat for `qa2` if needed)
+   - Source type: Docker
+   - Docker image: set to any valid placeholder initially; the workflow will overwrite it on first run
+   - Exposed port: `3000`
+
+2. **Add volume mount** (docker.sock):
    - Application → Advanced → Volumes
-   - Source: `/var/run/docker.sock`
-   - Destination: `/var/run/docker.sock`
-   - Type: `Bind`
+   - Source: `/var/run/docker.sock` / Destination: `/var/run/docker.sock` / Type: `Bind`
 
-5. **Set environment variables** from the Configuration table above via Application → Environment.
+3. **Set environment variables** from the Configuration table above via Application → Environment.
 
-7. **Verify webhook delivery** in GitHub → Repository Settings → Webhooks:
-   - Confirm the Dokploy webhook is listed and receiving events
-   - Trigger a test by opening a PR and adding the `preview-env` label
-   - Check Dokploy's deployment logs to confirm the build was triggered
+4. **Copy the `applicationId`** from Dokploy (Application → Settings → General) and set it as `DOKPLOY_APP_ID_QA1` in GitHub repository variables.
+
+5. **Configure domain** for the slot (e.g. `qa1.openmercato.com`) in Dokploy → Domains. Requires a DNS A record pointing to the Dokploy server IP.
 
 #### File Manifest
 
@@ -262,18 +293,17 @@ No files created. This phase is entirely Dokploy and DNS configuration.
 
 ### Phase 5: End-to-End Validation
 
-**Goal**: Confirm the full pipeline works from PR label to accessible preview URL.
+**Goal**: Confirm the full pipeline works from workflow trigger to accessible QA URL.
 
 #### Steps
 
-1. Open a test PR targeting `develop`.
-2. Add label `preview-env`.
-3. Confirm Dokploy receives the webhook and starts building the `preview` image (visible in Dokploy → Deployments).
+1. Trigger the `Deploy to Dokploy QA` workflow from GitHub Actions UI with `slot=qa1` and a target branch.
+2. Confirm the build completes and the image is pushed to GHCR.
+3. Confirm Dokploy receives the deploy trigger and starts pulling the new image (visible in Dokploy → Deployments).
 4. Wait ~10 minutes for the full startup sequence (install → generate → build → DB init → Next.js start).
-5. Confirm the generated preview URL (e.g. `https://preview-mercato-abc123.openmercato.com/backend`) is accessible and the backend login page loads.
-6. Push a new commit to the PR branch. Confirm Dokploy rebuilds and redeploys the preview automatically.
-7. Remove label `preview-env`. Confirm Dokploy stops and removes the preview application.
-8. Close the PR (with label present on a second test PR). Confirm Dokploy removes the preview on PR close.
+5. Confirm the QA slot URL (e.g. `https://qa1.openmercato.com/backend`) is accessible and the backend login page loads.
+6. Trigger a second deployment to the same slot. Confirm the first completes before the second starts (concurrency serialisation).
+7. Trigger a deployment with a custom `image_tag` override. Confirm the correct image is deployed.
 
 ---
 
@@ -281,15 +311,17 @@ No files created. This phase is entirely Dokploy and DNS configuration.
 
 ### Data Integrity Failures
 
-The QA environment is fully ephemeral and self-contained. No production data is involved. Risk is isolated to the QA environment itself.
+The QA environment is fully ephemeral and self-contained. No production data is involved. Risk is isolated to the QA slot.
 
 ### Cascading Failures & Side Effects
 
-- **docker.sock mount failure**: If the host Docker daemon is unavailable, `yarn test:integration:ephemeral:start` fails at the PostgreSQL startup step. The container exits with a non-zero code. Dokploy marks the deployment as failed. No data loss. Re-trigger by pushing a new commit or re-applying the label.
-
+- **GHCR push failure**: The `build-push-action` step fails; downstream Dokploy steps are skipped. Re-trigger the workflow.
+- **Dokploy API unavailable**: `saveDockerProvider` or `deploy` curl call fails (`-fsS` flags cause non-zero exit). Workflow fails with clear error. Re-trigger after resolving Dokploy connectivity.
+- **docker.sock mount failure**: If the host Docker daemon is unavailable, `yarn test:integration:ephemeral:start` fails at the PostgreSQL startup step. The container exits with a non-zero code. Dokploy marks the deployment as failed. Re-trigger the workflow.
 
 ### Migration & Deployment Risks
 
-- Adding the `preview` stage to the Dockerfile is purely additive. Existing `builder`, `dev`, and `runner` stages are unchanged.
+- `docker/preview/Dockerfile` is standalone and entirely separate from the main `Dockerfile`. Existing `builder`, `dev`, and `runner` stages in the main Dockerfile are unchanged.
+- The `NODE_ENV: process.env.NODE_ENV ?? 'test'` change in `integration.ts` is backward-compatible: CI and local runs that do not set `NODE_ENV` continue to default to `'test'`.
 - No database migrations in Open Mercato's production database are involved.
-
+- The workflow only has `contents: read` and `packages: write` permissions — it cannot modify repository settings or other GitHub resources.
