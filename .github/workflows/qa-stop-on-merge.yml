@@ -17,18 +17,26 @@ jobs:
     steps:
       - name: Detect QA slot label
         id: slot
-        shell: bash
-        run: |
-          set -euo pipefail
-          LABELS='${{ toJson(github.event.pull_request.labels) }}'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
 
-          if echo "$LABELS" | grep -q '"name":"qa:qa1"'; then
-            echo "slot=qa1" >> "$GITHUB_OUTPUT"
-          elif echo "$LABELS" | grep -q '"name":"qa:qa2"'; then
-            echo "slot=qa2" >> "$GITHUB_OUTPUT"
-          else
-            echo "slot=" >> "$GITHUB_OUTPUT"
-          fi
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              per_page: 100,
+            });
+
+            const names = labels.map(l => l.name);
+            core.info(`Current PR labels: ${names.join(', ') || '(none)'}`);
+
+            let slot = "";
+            if (names.includes("qa:qa1")) slot = "qa1";
+            if (names.includes("qa:qa2")) slot = "qa2";
+
+            core.setOutput("slot", slot);
 
       - name: Skip if no QA label
         if: ${{ steps.slot.outputs.slot == '' }}
