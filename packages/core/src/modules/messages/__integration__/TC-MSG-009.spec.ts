@@ -10,15 +10,19 @@ import {
 /**
  * Workaround for the DS v2 Input/Textarea primitive focus race that breaks Playwright
  * `.fill()` on controlled CrudForm fields. Click forces focus, an explicit clear handles
- * existing values, and `keyboard.type` walks key events through the focus pipeline.
+ * existing values, and `locator.fill` provides an atomic native value set plus dispatched
+ * input event so the controlled state commits deterministically.
+ *
+ * Extra safety against CI shard load (TC-MSG-009 retry trace, shard 9): explicitly wait
+ * for the input to be visible and enabled before interacting (slow renders / state-syncing
+ * mounts can leave the input temporarily blocked), follow with a hard `toHaveValue` gate
+ * extended to 60s so a busy parallel shard does not time out before React commits.
  */
 async function safeFill(page: Page, locator: Locator, value: string): Promise<void> {
-  await locator.click({ force: true });
-  await locator.focus();
-  await locator.press('ControlOrMeta+a');
-  await locator.press('Delete');
-  await page.keyboard.type(value);
-  await expect(locator).toHaveValue(value);
+  await expect(locator).toBeVisible({ timeout: 10_000 });
+  await expect(locator).toBeEnabled({ timeout: 10_000 });
+  await locator.fill(value);
+  await expect(locator).toHaveValue(value, { timeout: 60_000 });
 }
 
 async function waitForMessageDetailReady(page: Page, subject: string): Promise<void> {
@@ -49,6 +53,10 @@ async function openReplyFromHeader(page: Page): Promise<void> {
  */
 test.describe('TC-MSG-009: Message Detail Inline Reply And Forward Composer', () => {
   test('should compose inline below conversation, switch modes, close with escape, and submit forward/reply', async ({ page, request }) => {
+    // Multiple safeFill chains plus waitForResponse on submit; under CI shard 9
+    // parallel load each chain may consume ~10–80s of the default 20s budget.
+    test.setTimeout(180_000);
+
     let rootMessageId: string | null = null;
     let threadReplyMessageId: string | null = null;
     let forwardedMessageId: string | null = null;
@@ -153,6 +161,11 @@ test.describe('TC-MSG-009: Message Detail Inline Reply And Forward Composer', ()
       // handler, so Ctrl+Enter just inserts a newline. The composer header
       // renders a "Reply" submit button via FormHeader; .last() picks it
       // (the dropdown menu item is gone after openReplyFromHeader).
+      // Re-assert the textarea still holds the body. CI shard 9 trace shows
+      // the inline composer occasionally drops controlled state between fill
+      // and click — refilling here makes the failure mode loud (assertion
+      // error pointing at the resync) instead of a silent empty-body POST.
+      await expect(inlineReplyInput).toHaveValue(inlineReplyBody);
       await page.getByRole('button', { name: /^Reply$/i }).last().click();
       const inlineReplyResponse = await inlineReplyResponsePromise;
 
